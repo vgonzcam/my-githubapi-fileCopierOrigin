@@ -1,0 +1,123 @@
+name: 'Copy Files to Target Repository'
+description: 'Copy files to the default branch of target repository'
+inputs:
+  repository:
+    description: 'Target repository in format owner/repo'
+    required: true
+  github-token:
+    description: 'GitHub token for API access'
+    required: true
+  file-list:
+    description: 'Path to file containing list of files to copy'
+    required: true
+    default: 'files-to-be-copied.txt'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Prepare File List and Get Branch Info
+      id: prepare
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        repo="${{ inputs.repository }}"
+        file_list_file="${{ inputs.file-list }}"
+
+        if [[ ! -f "$file_list_file" ]]; then
+          echo "File list $file_list_file not found in current repository"
+          exit 1
+        fi
+
+        echo "Copying files from source repository to target repository: $repo"
+        echo "Reading file list from $file_list_file"
+
+        # Get the default branch name
+        echo "Getting default branch name for target repository"
+        default_branch=$(curl -sf -H "Authorization: Bearer $GITHUB_TOKEN" \
+          "https://api.github.com/repos/$repo" | jq -r '.default_branch')
+
+        if [[ -z "$default_branch" || "$default_branch" == "null" ]]; then
+          echo "Failed to get default branch name"
+          exit 1
+        fi
+
+        echo "Default branch: $default_branch"
+        echo "branch_name=$default_branch" >> $GITHUB_OUTPUT
+
+        # Get the SHA of the default branch
+        echo "Getting default branch SHA for target repository"
+        branch_sha=$(curl -sf -H "Authorization: Bearer $GITHUB_TOKEN" \
+          "https://api.github.com/repos/$repo/git/ref/heads/$default_branch" | \
+          jq -r '.object.sha')
+
+        if [[ -z "$branch_sha" || "$branch_sha" == "null" ]]; then
+          echo "Failed to get default branch SHA"
+          exit 1
+        fi
+
+        echo "Default branch SHA: $branch_sha"
+        echo "branch_sha=$branch_sha" >> $GITHUB_OUTPUT
+
+        # Get the default branch tree
+        echo "Getting default branch tree"
+        branch_tree_sha=$(curl -sf -H "Authorization: Bearer $GITHUB_TOKEN" \
+          "https://api.github.com/repos/$repo/git/commits/$branch_sha" | \
+          jq -r '.tree.sha')
+
+        if [[ -z "$branch_tree_sha" || "$branch_tree_sha" == "null" ]]; then
+          echo "Failed to get default branch tree SHA"
+          exit 1
+        fi
+
+        echo "Default tree SHA: $branch_tree_sha"
+        echo "branch_tree_sha=$branch_tree_sha" >> $GITHUB_OUTPUT
+
+        # Convert file list to JSON format
+        files_json="[]"
+        while IFS= read -r file; do
+          # Skip empty lines
+          [[ -z "$file" ]] && continue
+          
+          # Parse source and target
+          src="${file%%:*}"
+          tgt="${file#*:}"
+          
+          if [[ -z "$src" || -z "$tgt" ]]; then
+            echo "Invalid file pair: $file"
+            exit 1
+          fi
+          
+          # Check if source file exists
+          if [[ ! -f "$src" ]]; then
+            echo "Source file $src not found in current repository"
+            exit 1
+          fi
+          
+          files_json=$(echo "$files_json" | jq \
+            --arg source "$src" \
+            --arg target "$tgt" \
+            '. + [{"source":$source,"target":$target}]')
+        done < "$file_list_file"
+        
+        echo "files_json<<EOF" >> $GITHUB_OUTPUT
+        echo "$files_json" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    - name: Create and Push Commit
+      uses: ./.github/actions/create-commit
+      with:
+        repository: ${{ inputs.repository }}
+        github-token: ${{ inputs.github-token }}
+        branch-name: ${{ steps.prepare.outputs.branch_name }}
+        branch-sha: ${{ steps.prepare.outputs.branch_sha }}
+        branch-tree-sha: ${{ steps.prepare.outputs.branch_tree_sha }}
+        files-json: ${{ steps.prepare.outputs.files_json }}
+        commit-message: 'Add files from workflow repository'
+
+    - name: Report Success
+      shell: bash
+      run: |
+        echo "Successfully copied files to target repository"
+        echo "Files copied (from ${{ inputs.file-list }}):"
+        cat "${{ inputs.file-list }}"
