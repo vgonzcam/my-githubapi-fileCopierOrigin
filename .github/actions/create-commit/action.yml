@@ -1,0 +1,161 @@
+name: 'Create and Push Commit'
+description: 'Create blobs, tree, commit and update branch reference'
+inputs:
+  repository:
+    description: 'Target repository in format owner/repo'
+    required: true
+  github-token:
+    description: 'GitHub token for API access'
+    required: true
+  branch-name:
+    description: 'Branch name to commit to'
+    required: true
+  branch-sha:
+    description: 'Current SHA of the branch'
+    required: true
+  branch-tree-sha:
+    description: 'Tree SHA of the branch'
+    required: true
+  files-json:
+    description: 'JSON array of file pairs in format [{"source":"path/to/src","target":"path/to/tgt"}]'
+    required: true
+  commit-message:
+    description: 'Commit message'
+    required: true
+    default: 'Add files from workflow repository'
+
+outputs:
+  commit-sha:
+    description: 'SHA of the created commit'
+    value: ${{ steps.commit.outputs.commit_sha }}
+  success:
+    description: 'Whether the operation was successful'
+    value: ${{ steps.commit.outputs.success }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Create Commit
+      id: commit
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        repo="${{ inputs.repository }}"
+        branch="${{ inputs.branch-name }}"
+        branch_sha="${{ inputs.branch-sha }}"
+        branch_tree_sha="${{ inputs.branch-tree-sha }}"
+        commit_message="${{ inputs.commit-message }}"
+        
+        # Parse files JSON
+        files_json='${{ inputs.files-json }}'
+        
+        # Prepare tree entries for all files
+        tree_entries="[]"
+        
+        # Process each file from the JSON array
+        echo "$files_json" | jq -c '.[]' | while read -r file_obj; do
+          src=$(echo "$file_obj" | jq -r '.source')
+          tgt=$(echo "$file_obj" | jq -r '.target')
+          
+          if [[ -z "$src" || -z "$tgt" ]]; then
+            echo "Invalid file pair: $file_obj"
+            continue
+          fi
+          
+          # Check if source file exists
+          if [[ ! -f "$src" ]]; then
+            echo "Source file $src not found in current repository"
+            continue
+          fi
+          
+          # Read and encode the file content in base64
+          file_content=$(base64 -w 0 "$src")
+          
+          echo "File $src encoded, size: $(echo "$file_content" | wc -c) characters"
+          
+          # Create a blob with the file content
+          echo "Creating blob for $src"
+          blob_response=$(curl -sf -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\":\"$file_content\",\"encoding\":\"base64\"}" \
+            "https://api.github.com/repos/$repo/git/blobs")
+          
+          blob_sha=$(echo "$blob_response" | jq -r '.sha')
+          
+          if [[ -z "$blob_sha" || "$blob_sha" == "null" ]]; then
+            echo "Failed to create blob for $src"
+            echo "$blob_response"
+            continue
+          fi
+          
+          echo "Created blob with SHA: $blob_sha for $src"
+          
+          # Add to tree entries
+          tree_entries=$(echo "$tree_entries" | jq \
+            --arg path "$tgt" \
+            --arg sha "$blob_sha" \
+            '. + [{"path":$path,"mode":"100644","type":"blob","sha":$sha}]')
+        done
+        
+        # Create a new tree with all files
+        echo "Creating new tree with all files"
+        
+        echo "tree_entries JSON:" 
+        echo "$tree_entries" | jq .
+        
+        tree_response=$(curl -sf -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{\"base_tree\":\"$branch_tree_sha\",\"tree\":$tree_entries}" \
+          "https://api.github.com/repos/$repo/git/trees")
+        
+        echo "tree_response:"
+        echo "$tree_response"
+        
+        new_tree_sha=$(echo "$tree_response" | jq -r '.sha')
+        
+        if [[ -z "$new_tree_sha" || "$new_tree_sha" == "null" ]]; then
+          echo "Failed to create new tree"
+          echo "$tree_response"
+          echo "success=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+        
+        echo "Created new tree with SHA: $new_tree_sha"
+        
+        # Create a commit with the new tree
+        echo "Creating commit"
+        commit_response=$(curl -sf -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{\"message\":\"$commit_message\",\"tree\":\"$new_tree_sha\",\"parents\":[\"$branch_sha\"]}" \
+          "https://api.github.com/repos/$repo/git/commits")
+        
+        new_commit_sha=$(echo "$commit_response" | jq -r '.sha')
+        
+        if [[ -z "$new_commit_sha" || "$new_commit_sha" == "null" ]]; then
+          echo "Failed to create commit"
+          echo "$commit_response"
+          echo "success=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+        
+        echo "Created commit with SHA: $new_commit_sha"
+        echo "commit_sha=$new_commit_sha" >> $GITHUB_OUTPUT
+        
+        # Update the branch reference
+        echo "Updating branch reference for $branch"
+        update_response=$(curl -sf -X PATCH -H "Authorization: Bearer $GITHUB_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{\"sha\":\"$new_commit_sha\"}" \
+          "https://api.github.com/repos/$repo/git/refs/heads/$branch")
+        
+        if [[ $? -eq 0 ]]; then
+          echo "Successfully updated branch $branch"
+          echo "$update_response" | jq .
+          echo "success=true" >> $GITHUB_OUTPUT
+        else
+          echo "Failed to update branch reference for $branch"
+          echo "$update_response"
+          echo "success=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
