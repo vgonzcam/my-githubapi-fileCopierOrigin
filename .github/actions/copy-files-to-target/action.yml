@@ -21,78 +21,115 @@ runs:
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
+        echo "============================================"
+        echo "COPY FILES TO TARGET - PREPARATION PHASE"
+        echo "============================================"
+        echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+        echo ""
+        
         repo="${{ inputs.repository }}"
         file_list_file="${{ inputs.file-list }}"
+        
+        echo "Configuration:"
+        echo "  Target Repository: $repo"
+        echo "  File List: $file_list_file"
+        echo ""
 
+        # Validate file list exists
+        echo "[1/5] Validating file list..."
         if [[ ! -f "$file_list_file" ]]; then
-          echo "File list $file_list_file not found in current repository"
+          echo "❌ ERROR: File list $file_list_file not found in current repository"
           exit 1
         fi
+        echo "✅ File list found"
+        echo ""
 
-        echo "Copying files from source repository to target repository: $repo"
-        echo "Reading file list from $file_list_file"
+        # Display files to be copied
+        echo "[2/5] Files to be copied:"
+        cat "$file_list_file" | while IFS= read -r line; do
+          [[ -z "$line" ]] && continue
+          echo "  - $line"
+        done
+        echo ""
 
-        # Get the default branch name
-        echo "Getting default branch name for target repository"
+        # Get default branch
+        echo "[3/5] Getting default branch name for target repository..."
         default_branch=$(curl -sf -H "Authorization: Bearer $GITHUB_TOKEN" \
           "https://api.github.com/repos/$repo" | jq -r '.default_branch')
 
         if [[ -z "$default_branch" || "$default_branch" == "null" ]]; then
-          echo "Failed to get default branch name"
+          echo "❌ ERROR: Failed to get default branch name"
+          echo "Repository may not exist or token lacks permissions"
           exit 1
         fi
 
-        echo "Default branch: $default_branch"
+        echo "✅ Default branch: $default_branch"
         echo "branch_name=$default_branch" >> $GITHUB_OUTPUT
+        echo ""
 
-        # Get the SHA of the default branch
-        echo "Getting default branch SHA for target repository"
+        # Get branch SHA
+        echo "[4/5] Getting branch SHA for: $default_branch"
         branch_sha=$(curl -sf -H "Authorization: Bearer $GITHUB_TOKEN" \
           "https://api.github.com/repos/$repo/git/ref/heads/$default_branch" | \
           jq -r '.object.sha')
 
         if [[ -z "$branch_sha" || "$branch_sha" == "null" ]]; then
-          echo "Failed to get default branch SHA"
+          echo "❌ ERROR: Failed to get branch SHA"
           exit 1
         fi
 
-        echo "Default branch SHA: $branch_sha"
+        echo "✅ Branch SHA: $branch_sha"
         echo "branch_sha=$branch_sha" >> $GITHUB_OUTPUT
+        echo ""
 
-        # Get the default branch tree
-        echo "Getting default branch tree"
+        # Get branch tree
+        echo "[5/5] Getting branch tree SHA..."
         branch_tree_sha=$(curl -sf -H "Authorization: Bearer $GITHUB_TOKEN" \
           "https://api.github.com/repos/$repo/git/commits/$branch_sha" | \
           jq -r '.tree.sha')
 
         if [[ -z "$branch_tree_sha" || "$branch_tree_sha" == "null" ]]; then
-          echo "Failed to get default branch tree SHA"
+          echo "❌ ERROR: Failed to get branch tree SHA"
           exit 1
         fi
 
-        echo "Default tree SHA: $branch_tree_sha"
+        echo "✅ Branch tree SHA: $branch_tree_sha"
         echo "branch_tree_sha=$branch_tree_sha" >> $GITHUB_OUTPUT
+        echo ""
 
-        # Convert file list to JSON format
+        # Convert file list to JSON
+        echo "============================================"
+        echo "Converting file list to JSON format..."
+        echo "============================================"
+        
         files_json="[]"
+        file_counter=0
+        
         while IFS= read -r file; do
           # Skip empty lines
           [[ -z "$file" ]] && continue
+          
+          file_counter=$((file_counter + 1))
           
           # Parse source and target
           src="${file%%:*}"
           tgt="${file#*:}"
           
+          echo "[$file_counter] Processing: $src -> $tgt"
+          
           if [[ -z "$src" || -z "$tgt" ]]; then
-            echo "Invalid file pair: $file"
+            echo "  ❌ Invalid file pair format"
             exit 1
           fi
           
           # Check if source file exists
           if [[ ! -f "$src" ]]; then
-            echo "Source file $src not found in current repository"
+            echo "  ❌ Source file not found: $src"
             exit 1
           fi
+          
+          file_size=$(wc -c < "$src")
+          echo "  ✅ Source file exists (${file_size} bytes)"
           
           files_json=$(echo "$files_json" | jq \
             --arg source "$src" \
@@ -100,9 +137,18 @@ runs:
             '. + [{"source":$source,"target":$target}]')
         done < "$file_list_file"
         
+        echo ""
+        echo "Summary: $file_counter file(s) prepared for copying"
+        echo ""
+        
         echo "files_json<<EOF" >> $GITHUB_OUTPUT
         echo "$files_json" >> $GITHUB_OUTPUT
         echo "EOF" >> $GITHUB_OUTPUT
+        
+        echo "============================================"
+        echo "PREPARATION PHASE COMPLETED SUCCESSFULLY"
+        echo "============================================"
+        echo ""
 
     - name: Create and Push Commit
       uses: ./.github/actions/create-commit
@@ -118,6 +164,19 @@ runs:
     - name: Report Success
       shell: bash
       run: |
-        echo "Successfully copied files to target repository"
-        echo "Files copied (from ${{ inputs.file-list }}):"
-        cat "${{ inputs.file-list }}"
+        echo ""
+        echo "============================================"
+        echo "✅ COPY TO TARGET COMPLETED SUCCESSFULLY"
+        echo "============================================"
+        echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+        echo ""
+        echo "Target Repository: ${{ inputs.repository }}"
+        echo "Target Branch: ${{ steps.prepare.outputs.branch_name }}"
+        echo ""
+        echo "Files copied:"
+        cat "${{ inputs.file-list }}" | while IFS= read -r line; do
+          [[ -z "$line" ]] && continue
+          echo "  ✅ $line"
+        done
+        echo ""
+        echo "============================================"
