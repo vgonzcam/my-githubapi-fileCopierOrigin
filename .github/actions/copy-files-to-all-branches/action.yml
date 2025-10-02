@@ -15,55 +15,94 @@ inputs:
 runs:
   using: 'composite'
   steps:
-    - name: Get All Branches and Process
+    - name: Get All Branches and Prepare
+      id: prepare
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
+        echo "============================================"
+        echo "COPY FILES TO ALL BRANCHES - PREPARATION"
+        echo "============================================"
+        echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+        echo ""
+        
         repo="${{ inputs.repository }}"
         file_list_file="${{ inputs.file-list }}"
 
+        echo "Configuration:"
+        echo "  Target Repository: $repo"
+        echo "  File List: $file_list_file"
+        echo ""
+
+        # Validate file list
+        echo "[1/3] Validating file list..."
         if [[ ! -f "$file_list_file" ]]; then
-          echo "File list $file_list_file not found in current repository"
+          echo "❌ ERROR: File list $file_list_file not found"
           exit 1
         fi
+        echo "✅ File list found"
+        echo ""
 
-        echo "Copying files from source repository to ALL branches in target repository: $repo"
-        echo "Reading file list from $file_list_file"
+        # Display files
+        echo "[2/3] Files to be copied to ALL branches:"
+        cat "$file_list_file" | while IFS= read -r line; do
+          [[ -z "$line" ]] && continue
+          echo "  - $line"
+        done
+        echo ""
 
-        # Get all branches in the target repository
-        echo "Getting all branches for target repository"
+        # Get all branches
+        echo "[3/3] Fetching all branches from target repository..."
         branches=$(curl -sf -H "Authorization: Bearer $GITHUB_TOKEN" \
           "https://api.github.com/repos/$repo/branches?per_page=100" | jq -r '.[].name')
 
         if [[ -z "$branches" ]]; then
-          echo "Failed to get branches for target repository"
+          echo "❌ ERROR: Failed to get branches"
+          echo "Repository may not exist or token lacks permissions"
           exit 1
         fi
 
-        # Save branches to a file for later processing
+        # Count and display branches
+        branch_count=$(echo "$branches" | wc -l)
+        echo "✅ Found $branch_count branch(es):"
+        echo "$branches" | while IFS= read -r branch; do
+          echo "  - $branch"
+        done
+        echo ""
+
+        # Save branches to file
         echo "$branches" > /tmp/branches.txt
         
-        # Convert file list to JSON format once
+        # Convert file list to JSON
+        echo "============================================"
+        echo "Converting file list to JSON..."
+        echo "============================================"
+        
         files_json="[]"
+        file_counter=0
+        
         while IFS= read -r file; do
-          # Skip empty lines
           [[ -z "$file" ]] && continue
           
-          # Parse source and target
+          file_counter=$((file_counter + 1))
           src="${file%%:*}"
           tgt="${file#*:}"
           
+          echo "[$file_counter] $src -> $tgt"
+          
           if [[ -z "$src" || -z "$tgt" ]]; then
-            echo "Invalid file pair: $file"
+            echo "  ❌ Invalid format"
             continue
           fi
           
-          # Check if source file exists
           if [[ ! -f "$src" ]]; then
-            echo "Source file $src not found in current repository"
+            echo "  ❌ Source not found"
             continue
           fi
+          
+          file_size=$(wc -c < "$src")
+          echo "  ✅ Ready (${file_size} bytes)"
           
           files_json=$(echo "$files_json" | jq \
             --arg source "$src" \
@@ -71,78 +110,99 @@ runs:
             '. + [{"source":$source,"target":$target}]')
         done < "$file_list_file"
         
-        # Save files JSON for use in subsequent steps
+        echo ""
+        echo "Prepared $file_counter file(s) for $branch_count branch(es)"
+        echo "Total operations: $((file_counter * branch_count))"
+        echo ""
+        
+        # Save files JSON
         echo "$files_json" > /tmp/files.json
+        
+        echo "============================================"
+        echo "PREPARATION COMPLETED"
+        echo "============================================"
+        echo ""
 
     - name: Process Each Branch
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
+        echo "============================================"
+        echo "STARTING BRANCH PROCESSING"
+        echo "============================================"
+        echo ""
+        
         repo="${{ inputs.repository }}"
         files_json=$(cat /tmp/files.json)
         
+        branch_number=0
+        total_branches=$(wc -l < /tmp/branches.txt)
+        successful_branches=0
+        failed_branches=0
+        
         while IFS= read -r branch; do
-          echo "=========================================="
-          echo "Processing branch: $branch"
-          echo "=========================================="
+          branch_number=$((branch_number + 1))
+          
+          echo ""
+          echo "╔════════════════════════════════════════════════════════════"
+          echo "║ BRANCH $branch_number/$total_branches: $branch"
+          echo "╚════════════════════════════════════════════════════════════"
+          echo "Started: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo ""
 
-          # Get the SHA of the branch
+          # Get branch SHA
+          echo "  [1/6] Getting branch SHA..."
           branch_sha=$(curl -sf -H "Authorization: Bearer $GITHUB_TOKEN" \
             "https://api.github.com/repos/$repo/git/ref/heads/$branch" | jq -r '.object.sha')
 
           if [[ -z "$branch_sha" || "$branch_sha" == "null" ]]; then
-            echo "Failed to get branch SHA for $branch"
+            echo "  ❌ Failed to get branch SHA"
+            failed_branches=$((failed_branches + 1))
             continue
           fi
+          echo "  ✅ SHA: $branch_sha"
 
-          echo "Branch SHA: $branch_sha"
-
-          # Get the branch tree
+          # Get branch tree
+          echo "  [2/6] Getting branch tree..."
           branch_tree_sha=$(curl -sf -H "Authorization: Bearer $GITHUB_TOKEN" \
             "https://api.github.com/repos/$repo/git/commits/$branch_sha" | jq -r '.tree.sha')
 
           if [[ -z "$branch_tree_sha" || "$branch_tree_sha" == "null" ]]; then
-            echo "Failed to get branch tree SHA for $branch"
+            echo "  ❌ Failed to get tree SHA"
+            failed_branches=$((failed_branches + 1))
             continue
           fi
+          echo "  ✅ Tree SHA: $branch_tree_sha"
 
-          echo "Branch tree SHA: $branch_tree_sha"
-          
-          # Save branch info for the commit action
-          echo "$branch" > /tmp/current_branch.txt
-          echo "$branch_sha" > /tmp/current_branch_sha.txt
-          echo "$branch_tree_sha" > /tmp/current_branch_tree_sha.txt
-          
-          # Call the create-commit action
-          # Note: We need to do this inline since composite actions can't call other composite actions in a loop
-          
-          # Prepare tree entries for all files
+          # Create blobs
+          echo "  [3/6] Creating blobs for files..."
           tree_entries="[]"
+          file_index=0
+          file_count=$(echo "$files_json" | jq 'length')
           
-          # Process each file from the JSON array
-          echo "$files_json" | jq -c '.[]' | while read -r file_obj; do
+          for ((i=0; i<file_count; i++)); do
+            file_obj=$(echo "$files_json" | jq -c ".[$i]")
             src=$(echo "$file_obj" | jq -r '.source')
             tgt=$(echo "$file_obj" | jq -r '.target')
+            file_index=$((file_index + 1))
             
-            if [[ -z "$src" || -z "$tgt" ]]; then
-              echo "Invalid file pair: $file_obj"
+            echo "    [$file_index/$file_count] $src -> $tgt"
+            
+            if [[ -z "$src" || -z "$tgt" || "$src" == "null" || "$tgt" == "null" ]]; then
+              echo "      ⚠️  Skipped: Invalid format"
               continue
             fi
             
-            # Check if source file exists
             if [[ ! -f "$src" ]]; then
-              echo "Source file $src not found in current repository"
+              echo "      ⚠️  Skipped: File not found"
               continue
             fi
             
-            # Read and encode the file content in base64
             file_content=$(base64 -w 0 "$src")
+            content_size=$(echo "$file_content" | wc -c)
+            echo "      📦 Encoded: $content_size chars"
             
-            echo "File $src encoded, size: $(echo "$file_content" | wc -c) characters"
-            
-            # Create a blob with the file content
-            echo "Creating blob for $src"
             blob_response=$(curl -sf -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
               -H "Content-Type: application/json" \
               -d "{\"content\":\"$file_content\",\"encoding\":\"base64\"}" \
@@ -151,62 +211,89 @@ runs:
             blob_sha=$(echo "$blob_response" | jq -r '.sha')
             
             if [[ -z "$blob_sha" || "$blob_sha" == "null" ]]; then
-              echo "Failed to create blob for $src"
-              echo "$blob_response"
+              echo "      ❌ Failed to create blob"
               continue
             fi
             
-            echo "Created blob with SHA: $blob_sha for $src"
+            echo "      ✅ Blob: $blob_sha"
             
-            # Add to tree entries
             tree_entries=$(echo "$tree_entries" | jq \
               --arg path "$tgt" \
               --arg sha "$blob_sha" \
               '. + [{"path":$path,"mode":"100644","type":"blob","sha":$sha}]')
           done
-          
-          # Create a new tree with all files
-          echo "Creating new tree with all files"
+
+          entries_count=$(echo "$tree_entries" | jq 'length')
+          echo "  ✅ Created $entries_count blob(s)"
+
+          # Create tree
+          echo "  [4/6] Creating tree..."
           tree_response=$(curl -sf -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Content-Type: application/json" \
             -d "{\"base_tree\":\"$branch_tree_sha\",\"tree\":$tree_entries}" \
             "https://api.github.com/repos/$repo/git/trees")
+          
           new_tree_sha=$(echo "$tree_response" | jq -r '.sha')
+          
           if [[ -z "$new_tree_sha" || "$new_tree_sha" == "null" ]]; then
-            echo "Failed to create new tree for $branch"
+            echo "  ❌ Failed to create tree"
+            failed_branches=$((failed_branches + 1))
             continue
           fi
+          echo "  ✅ Tree SHA: $new_tree_sha"
 
-          echo "Created new tree with SHA: $new_tree_sha"
-
-          # Create a commit with the new tree
-          echo "Creating commit"
+          # Create commit
+          echo "  [5/6] Creating commit..."
           commit_message="Add files from workflow repository to branch $branch"
           commit_response=$(curl -sf -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Content-Type: application/json" \
             -d "{\"message\":\"$commit_message\",\"tree\":\"$new_tree_sha\",\"parents\":[\"$branch_sha\"]}" \
             "https://api.github.com/repos/$repo/git/commits")
+          
           new_commit_sha=$(echo "$commit_response" | jq -r '.sha')
+          
           if [[ -z "$new_commit_sha" || "$new_commit_sha" == "null" ]]; then
-            echo "Failed to create commit for $branch"
+            echo "  ❌ Failed to create commit"
+            failed_branches=$((failed_branches + 1))
             continue
           fi
+          echo "  ✅ Commit SHA: $new_commit_sha"
 
-          echo "Created commit with SHA: $new_commit_sha"
-
-          # Update the branch reference
-          echo "Updating branch reference"
+          # Update branch
+          echo "  [6/6] Updating branch reference..."
           update_response=$(curl -sf -X PATCH -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Content-Type: application/json" \
             -d "{\"sha\":\"$new_commit_sha\"}" \
             "https://api.github.com/repos/$repo/git/refs/heads/$branch")
+          
           if [[ $? -eq 0 ]]; then
-            echo "Successfully copied files to branch $branch"
-            echo "Files copied (from ${{ inputs.file-list }}):"
-            cat "${{ inputs.file-list }}"
-            echo "$update_response" | jq .
+            echo "  ✅ Branch updated successfully"
+            successful_branches=$((successful_branches + 1))
+            echo ""
+            echo "  ✅ BRANCH $branch COMPLETED SUCCESSFULLY"
           else
-            echo "Failed to update branch reference for $branch"
-            echo "$update_response"
+            echo "  ❌ Failed to update branch"
+            failed_branches=$((failed_branches + 1))
+            echo ""
+            echo "  ❌ BRANCH $branch FAILED"
           fi
+          
+          echo "  Finished: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
         done < /tmp/branches.txt
+        
+        echo ""
+        echo "============================================"
+        echo "FINAL SUMMARY"
+        echo "============================================"
+        echo "Total branches processed: $total_branches"
+        echo "✅ Successful: $successful_branches"
+        echo "❌ Failed: $failed_branches"
+        echo ""
+        
+        if [[ $failed_branches -gt 0 ]]; then
+          echo "⚠️  Some branches failed. Check logs above for details."
+          exit 1
+        else
+          echo "✅ ALL BRANCHES COMPLETED SUCCESSFULLY"
+        fi
+        echo "============================================"
