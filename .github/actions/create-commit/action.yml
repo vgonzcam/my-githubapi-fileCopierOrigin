@@ -50,15 +50,25 @@ runs:
         # Parse files JSON
         files_json='${{ inputs.files-json }}'
         
+        echo "Files to process:"
+        echo "$files_json" | jq .
+        
         # Prepare tree entries for all files
         tree_entries="[]"
         
-        # Process each file from the JSON array
-        echo "$files_json" | jq -c '.[]' | while read -r file_obj; do
+        # Get the count of files
+        file_count=$(echo "$files_json" | jq 'length')
+        echo "Processing $file_count files"
+        
+        # Process each file from the JSON array using a for loop with index
+        for ((i=0; i<file_count; i++)); do
+          file_obj=$(echo "$files_json" | jq -c ".[$i]")
           src=$(echo "$file_obj" | jq -r '.source')
           tgt=$(echo "$file_obj" | jq -r '.target')
           
-          if [[ -z "$src" || -z "$tgt" ]]; then
+          echo "Processing file $((i+1))/$file_count: $src -> $tgt"
+          
+          if [[ -z "$src" || -z "$tgt" || "$src" == "null" || "$tgt" == "null" ]]; then
             echo "Invalid file pair: $file_obj"
             continue
           fi
@@ -96,10 +106,20 @@ runs:
             --arg path "$tgt" \
             --arg sha "$blob_sha" \
             '. + [{"path":$path,"mode":"100644","type":"blob","sha":$sha}]')
+          
+          echo "Current tree entries count: $(echo "$tree_entries" | jq 'length')"
         done
         
+        # Verify we have tree entries
+        entry_count=$(echo "$tree_entries" | jq 'length')
+        if [[ "$entry_count" -eq 0 ]]; then
+          echo "ERROR: No tree entries created. Cannot proceed."
+          echo "success=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+        
         # Create a new tree with all files
-        echo "Creating new tree with all files"
+        echo "Creating new tree with $entry_count files"
         
         echo "tree_entries JSON:" 
         echo "$tree_entries" | jq .
