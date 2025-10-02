@@ -1,0 +1,2 @@
+demo/data.txt:demo/data.txt
+data.txt:demo/dataFromRoot.txt
