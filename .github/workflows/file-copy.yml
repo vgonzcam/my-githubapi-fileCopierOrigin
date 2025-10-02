@@ -1,0 +1,58 @@
+name: TPT-PRE-PrimaryPreliminaryIACActionsFileCopy
+run-name: Action ${{ inputs.action }} - Destination ${{ inputs.repository }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Select the repository management action to perform."
+        required: true
+        default: "copy-file-to-target"
+        type: choice
+        options:
+          - copy-file-to-target
+          - copy-file-to-target-and-branches
+      repository:
+        description: |
+          Target repository in the format "owner/repo".
+          Example: "owner/repo"
+        required: true
+        type: string
+
+env:
+  GITHUB_TOKEN: ${{ secrets.BTP_GITHUB_PAT }}
+
+jobs:
+  copy-to-default-branch:
+    if: inputs.action == 'copy-file-to-target'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.BTP_GITHUB_PAT }}
+          fetch-depth: 0
+
+      - name: Copy Files to Default Branch
+        uses: ./.github/actions/copy-files-to-target
+        with:
+          repository: ${{ inputs.repository }}
+          github-token: ${{ secrets.BTP_GITHUB_PAT }}
+          file-list: files-to-be-copied.txt
+
+  copy-to-all-branches:
+    if: inputs.action == 'copy-file-to-target-and-branches'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.BTP_GITHUB_PAT }}
+          fetch-depth: 0
+
+      - name: Copy Files to All Branches
+        uses: ./.github/actions/copy-files-to-all-branches
+        with:
+          repository: ${{ inputs.repository }}
+          github-token: ${{ secrets.BTP_GITHUB_PAT }}
+          file-list: files-to-be-copied.txt
