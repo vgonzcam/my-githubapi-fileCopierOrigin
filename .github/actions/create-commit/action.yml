@@ -1,5 +1,5 @@
 name: 'Create and Push Commit'
-description: 'Create blobs, tree, commit and update branch reference'
+description: 'Create blobs, tree, commit and update branch reference with comprehensive error logging'
 inputs:
   repository:
     description: 'Target repository in format owner/repo'
@@ -35,147 +35,430 @@ outputs:
 runs:
   using: 'composite'
   steps:
-    - name: Create Commit
+    - name: Create Commit with Error Handling
       id: commit
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
+        # Error logging function
+        log_api_error() {
+          local operation=$1
+          local http_code=$2
+          local response=$3
+          local url=$4
+          
+          echo ""
+          echo "╔═══════════════════════════════════════════════════════════════"
+          echo "║ ❌ GitHub API ERROR"
+          echo "╠═══════════════════════════════════════════════════════════════"
+          echo "║ Operation: $operation"
+          echo "║ HTTP Status Code: $http_code"
+          echo "║ URL: $url"
+          echo "║ Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "╠═══════════════════════════════════════════════════════════════"
+          echo "║ Response Body:"
+          echo "╠═══════════════════════════════════════════════════════════════"
+          
+          if [[ -n "$response" && "$response" != "null" ]]; then
+            echo "$response" | jq '.' 2>/dev/null || echo "$response"
+          else
+            echo "║ (Empty or invalid JSON response)"
+          fi
+          
+          echo "╠═══════════════════════════════════════════════════════════════"
+          
+          # Parse and display specific error details if available
+          if echo "$response" | jq -e '.message' > /dev/null 2>&1; then
+            error_message=$(echo "$response" | jq -r '.message')
+            echo "║ Error Message: $error_message"
+          fi
+          
+          if echo "$response" | jq -e '.errors' > /dev/null 2>&1; then
+            echo "║ Detailed Errors:"
+            echo "$response" | jq -r '.errors[] | "║   - \(.message // .code // .)"'
+          fi
+          
+          if echo "$response" | jq -e '.documentation_url' > /dev/null 2>&1; then
+            doc_url=$(echo "$response" | jq -r '.documentation_url')
+            echo "║ Documentation: $doc_url"
+          fi
+          
+          echo "╠═══════════════════════════════════════════════════════════════"
+          
+          # Interpret common HTTP status codes
+          case $http_code in
+            401)
+              echo "║ CAUSE: Authentication failed"
+              echo "║ SOLUTION: Check that your GitHub token is valid and not expired"
+              echo "║          Verify the token is correctly set in repository secrets"
+              ;;
+            403)
+              echo "║ CAUSE: Authorization failed or rate limit exceeded"
+              echo "║ SOLUTION: Ensure the token has required permissions:"
+              echo "║          - Contents: Read & Write"
+              echo "║          - Metadata: Read"
+              echo "║          Check if rate limit is exceeded"
+              ;;
+            404)
+              echo "║ CAUSE: Resource not found"
+              echo "║ SOLUTION: Verify the repository exists and is accessible"
+              echo "║          Check repository name format: owner/repo"
+              echo "║          Ensure token has access to the repository"
+              ;;
+            422)
+              echo "║ CAUSE: Unprocessable entity / Validation failed"
+              echo "║ SOLUTION: Check the request payload format"
+              echo "║          Verify all required fields are present"
+              echo "║          Ensure SHAs are valid and references exist"
+              ;;
+            500|502|503)
+              echo "║ CAUSE: GitHub server error"
+              echo "║ SOLUTION: This is a temporary GitHub issue"
+              echo "║          Retry the operation"
+              echo "║          Check GitHub status: https://www.githubstatus.com"
+              ;;
+            *)
+              echo "║ CAUSE: Unexpected HTTP status code"
+              echo "║ SOLUTION: Review the response body above for details"
+              ;;
+          esac
+          
+          echo "╚═══════════════════════════════════════════════════════════════"
+          echo ""
+        }
+        
+        # API call wrapper with error handling
+        call_github_api() {
+          local method=$1
+          local url=$2
+          local data=$3
+          local operation=$4
+          local output_var=$5
+          
+          echo "  🔄 API Call: $operation"
+          echo "     Method: $method"
+          echo "     URL: $url"
+          
+          if [[ -n "$data" ]]; then
+            echo "     Payload size: $(echo "$data" | wc -c) bytes"
+          fi
+          
+          # Make the API call and capture both response and HTTP code
+          local temp_file=$(mktemp)
+          local http_code
+          
+          if [[ "$method" == "GET" ]]; then
+            http_code=$(curl -s -w "%{http_code}" -o "$temp_file" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$url")
+          else
+            http_code=$(curl -s -w "%{http_code}" -o "$temp_file" \
+              -X "$method" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -H "Content-Type: application/json" \
+              -d "$data" \
+              "$url")
+          fi
+          
+          local response=$(cat "$temp_file")
+          rm "$temp_file"
+          
+          echo "     HTTP Status: $http_code"
+          
+          # Check if request was successful (2xx status codes)
+          if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+            echo "     ✅ Success"
+            
+            # Store response in output variable if specified
+            if [[ -n "$output_var" ]]; then
+              eval "$output_var='$response'"
+            fi
+            
+            return 0
+          else
+            echo "     ❌ Failed"
+            log_api_error "$operation" "$http_code" "$response" "$url"
+            return 1
+          fi
+        }
+        
+        echo "============================================"
+        echo "CREATE COMMIT ACTION"
+        echo "============================================"
+        echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+        echo ""
+        
         repo="${{ inputs.repository }}"
         branch="${{ inputs.branch-name }}"
         branch_sha="${{ inputs.branch-sha }}"
         branch_tree_sha="${{ inputs.branch-tree-sha }}"
         commit_message="${{ inputs.commit-message }}"
         
+        echo "Configuration:"
+        echo "  Repository: $repo"
+        echo "  Branch: $branch"
+        echo "  Branch SHA: $branch_sha"
+        echo "  Tree SHA: $branch_tree_sha"
+        echo "  Commit Message: $commit_message"
+        echo ""
+        
         # Parse files JSON
         files_json='${{ inputs.files-json }}'
         
-        echo "Files to process:"
-        echo "$files_json" | jq .
+        echo "============================================"
+        echo "PHASE 1: FILE VALIDATION"
+        echo "============================================"
         
-        # Prepare tree entries for all files
-        tree_entries="[]"
-        
-        # Get the count of files
         file_count=$(echo "$files_json" | jq 'length')
-        echo "Processing $file_count files"
+        echo "Files to process: $file_count"
+        echo ""
         
-        # Process each file from the JSON array using a for loop with index
+        if [[ "$file_count" -eq 0 ]]; then
+          echo "❌ ERROR: No files provided"
+          echo "success=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+        
+        # Display all files
+        echo "File list:"
+        echo "$files_json" | jq -r '.[] | "  \(.source) -> \(.target)"'
+        echo ""
+        
+        # Validate all files exist
+        echo "Validating files..."
+        validation_failed=0
+        for ((i=0; i<file_count; i++)); do
+          src=$(echo "$files_json" | jq -r ".[$i].source")
+          tgt=$(echo "$files_json" | jq -r ".[$i].target")
+          
+          echo "  [$((i+1))/$file_count] Checking: $src"
+          
+          if [[ ! -f "$src" ]]; then
+            echo "    ❌ File not found"
+            validation_failed=1
+          else
+            file_size=$(wc -c < "$src")
+            echo "    ✅ Found (${file_size} bytes)"
+          fi
+        done
+        
+        if [[ $validation_failed -eq 1 ]]; then
+          echo ""
+          echo "❌ ERROR: File validation failed"
+          echo "success=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+        
+        echo ""
+        echo "✅ All files validated"
+        echo ""
+        
+        echo "============================================"
+        echo "PHASE 2: BLOB CREATION"
+        echo "============================================"
+        
+        tree_entries="[]"
+        blobs_created=0
+        blobs_failed=0
+        
         for ((i=0; i<file_count; i++)); do
           file_obj=$(echo "$files_json" | jq -c ".[$i]")
           src=$(echo "$file_obj" | jq -r '.source')
           tgt=$(echo "$file_obj" | jq -r '.target')
           
-          echo "Processing file $((i+1))/$file_count: $src -> $tgt"
+          echo ""
+          echo "[$((i+1))/$file_count] Processing: $src"
+          echo "  Target path: $tgt"
           
           if [[ -z "$src" || -z "$tgt" || "$src" == "null" || "$tgt" == "null" ]]; then
-            echo "Invalid file pair: $file_obj"
+            echo "  ❌ Invalid file pair"
+            blobs_failed=$((blobs_failed + 1))
             continue
           fi
           
-          # Check if source file exists
           if [[ ! -f "$src" ]]; then
-            echo "Source file $src not found in current repository"
+            echo "  ❌ Source file not found"
+            blobs_failed=$((blobs_failed + 1))
             continue
           fi
           
-          # Read and encode the file content in base64
+          # Encode file
+          echo "  📦 Encoding file..."
           file_content=$(base64 -w 0 "$src")
+          content_size=$(echo "$file_content" | wc -c)
+          echo "  📦 Encoded size: $content_size characters"
           
-          echo "File $src encoded, size: $(echo "$file_content" | wc -c) characters"
-          
-          # Create a blob with the file content
-          echo "Creating blob for $src"
-          blob_response=$(curl -sf -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "{\"content\":\"$file_content\",\"encoding\":\"base64\"}" \
-            "https://api.github.com/repos/$repo/git/blobs")
-          
-          blob_sha=$(echo "$blob_response" | jq -r '.sha')
-          
-          if [[ -z "$blob_sha" || "$blob_sha" == "null" ]]; then
-            echo "Failed to create blob for $src"
-            echo "$blob_response"
+          # Validate encoded content
+          if [[ -z "$file_content" ]]; then
+            echo "  ❌ Failed to encode file"
+            blobs_failed=$((blobs_failed + 1))
             continue
           fi
           
-          echo "Created blob with SHA: $blob_sha for $src"
+          # Create blob with error handling
+          blob_payload="{\"content\":\"$file_content\",\"encoding\":\"base64\"}"
+          blob_response=""
           
-          # Add to tree entries
-          tree_entries=$(echo "$tree_entries" | jq \
-            --arg path "$tgt" \
-            --arg sha "$blob_sha" \
-            '. + [{"path":$path,"mode":"100644","type":"blob","sha":$sha}]')
-          
-          echo "Current tree entries count: $(echo "$tree_entries" | jq 'length')"
+          if call_github_api "POST" \
+            "https://api.github.com/repos/$repo/git/blobs" \
+            "$blob_payload" \
+            "Create blob for $src" \
+            "blob_response"; then
+            
+            blob_sha=$(echo "$blob_response" | jq -r '.sha')
+            
+            if [[ -z "$blob_sha" || "$blob_sha" == "null" ]]; then
+              echo "  ❌ Invalid blob SHA in response"
+              blobs_failed=$((blobs_failed + 1))
+              continue
+            fi
+            
+            echo "  ✅ Blob created: $blob_sha"
+            blobs_created=$((blobs_created + 1))
+            
+            # Add to tree entries
+            tree_entries=$(echo "$tree_entries" | jq \
+              --arg path "$tgt" \
+              --arg sha "$blob_sha" \
+              '. + [{"path":$path,"mode":"100644","type":"blob","sha":$sha}]')
+            
+            current_entries=$(echo "$tree_entries" | jq 'length')
+            echo "  📋 Tree entries: $current_entries"
+          else
+            echo "  ❌ Failed to create blob"
+            blobs_failed=$((blobs_failed + 1))
+          fi
         done
+        
+        echo ""
+        echo "────────────────────────────────────────────"
+        echo "Blob creation summary:"
+        echo "  ✅ Created: $blobs_created"
+        echo "  ❌ Failed: $blobs_failed"
+        echo "────────────────────────────────────────────"
+        echo ""
         
         # Verify we have tree entries
         entry_count=$(echo "$tree_entries" | jq 'length')
         if [[ "$entry_count" -eq 0 ]]; then
-          echo "ERROR: No tree entries created. Cannot proceed."
+          echo "❌ ERROR: No tree entries created"
+          echo "   All blob creations failed. Check errors above."
           echo "success=false" >> $GITHUB_OUTPUT
           exit 1
         fi
         
-        # Create a new tree with all files
-        echo "Creating new tree with $entry_count files"
+        echo "✅ $entry_count tree entry/entries ready"
+        echo ""
         
-        echo "tree_entries JSON:" 
-        echo "$tree_entries" | jq .
+        echo "============================================"
+        echo "PHASE 3: TREE CREATION"
+        echo "============================================"
         
-        tree_response=$(curl -sf -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
-          -H "Content-Type: application/json" \
-          -d "{\"base_tree\":\"$branch_tree_sha\",\"tree\":$tree_entries}" \
-          "https://api.github.com/repos/$repo/git/trees")
+        echo "Tree entries to be created:"
+        echo "$tree_entries" | jq -r '.[] | "  \(.path) <- \(.sha)"'
+        echo ""
         
-        echo "tree_response:"
-        echo "$tree_response"
+        tree_payload="{\"base_tree\":\"$branch_tree_sha\",\"tree\":$tree_entries}"
+        tree_response=""
+        
+        if ! call_github_api "POST" \
+          "https://api.github.com/repos/$repo/git/trees" \
+          "$tree_payload" \
+          "Create tree" \
+          "tree_response"; then
+          
+          echo "❌ ERROR: Failed to create tree"
+          echo "success=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
         
         new_tree_sha=$(echo "$tree_response" | jq -r '.sha')
         
         if [[ -z "$new_tree_sha" || "$new_tree_sha" == "null" ]]; then
-          echo "Failed to create new tree"
-          echo "$tree_response"
+          echo "❌ ERROR: Invalid tree SHA in response"
           echo "success=false" >> $GITHUB_OUTPUT
           exit 1
         fi
         
-        echo "Created new tree with SHA: $new_tree_sha"
+        echo "✅ Tree created: $new_tree_sha"
+        echo ""
         
-        # Create a commit with the new tree
-        echo "Creating commit"
-        commit_response=$(curl -sf -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
-          -H "Content-Type: application/json" \
-          -d "{\"message\":\"$commit_message\",\"tree\":\"$new_tree_sha\",\"parents\":[\"$branch_sha\"]}" \
-          "https://api.github.com/repos/$repo/git/commits")
+        echo "============================================"
+        echo "PHASE 4: COMMIT CREATION"
+        echo "============================================"
+        
+        echo "Commit details:"
+        echo "  Message: $commit_message"
+        echo "  Tree: $new_tree_sha"
+        echo "  Parent: $branch_sha"
+        echo ""
+        
+        commit_payload="{\"message\":\"$commit_message\",\"tree\":\"$new_tree_sha\",\"parents\":[\"$branch_sha\"]}"
+        commit_response=""
+        
+        if ! call_github_api "POST" \
+          "https://api.github.com/repos/$repo/git/commits" \
+          "$commit_payload" \
+          "Create commit" \
+          "commit_response"; then
+          
+          echo "❌ ERROR: Failed to create commit"
+          echo "success=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
         
         new_commit_sha=$(echo "$commit_response" | jq -r '.sha')
         
         if [[ -z "$new_commit_sha" || "$new_commit_sha" == "null" ]]; then
-          echo "Failed to create commit"
-          echo "$commit_response"
+          echo "❌ ERROR: Invalid commit SHA in response"
           echo "success=false" >> $GITHUB_OUTPUT
           exit 1
         fi
         
-        echo "Created commit with SHA: $new_commit_sha"
+        echo "✅ Commit created: $new_commit_sha"
         echo "commit_sha=$new_commit_sha" >> $GITHUB_OUTPUT
+        echo ""
         
-        # Update the branch reference
-        echo "Updating branch reference for $branch"
-        update_response=$(curl -sf -X PATCH -H "Authorization: Bearer $GITHUB_TOKEN" \
-          -H "Content-Type: application/json" \
-          -d "{\"sha\":\"$new_commit_sha\"}" \
-          "https://api.github.com/repos/$repo/git/refs/heads/$branch")
+        echo "============================================"
+        echo "PHASE 5: BRANCH UPDATE"
+        echo "============================================"
         
-        if [[ $? -eq 0 ]]; then
-          echo "Successfully updated branch $branch"
-          echo "$update_response" | jq .
-          echo "success=true" >> $GITHUB_OUTPUT
-        else
-          echo "Failed to update branch reference for $branch"
-          echo "$update_response"
+        echo "Updating branch: $branch"
+        echo "New commit: $new_commit_sha"
+        echo ""
+        
+        update_payload="{\"sha\":\"$new_commit_sha\"}"
+        update_response=""
+        
+        if ! call_github_api "PATCH" \
+          "https://api.github.com/repos/$repo/git/refs/heads/$branch" \
+          "$update_payload" \
+          "Update branch reference" \
+          "update_response"; then
+          
+          echo "❌ ERROR: Failed to update branch reference"
           echo "success=false" >> $GITHUB_OUTPUT
           exit 1
         fi
+        
+        echo "✅ Branch updated successfully"
+        echo ""
+        echo "Update details:"
+        echo "$update_response" | jq '.'
+        echo ""
+        echo "success=true" >> $GITHUB_OUTPUT
+        
+        echo "============================================"
+        echo "✅ COMMIT COMPLETED SUCCESSFULLY"
+        echo "============================================"
+        echo "Final commit SHA: $new_commit_sha"
+        echo "Branch: $branch"
+        echo "Repository: $repo"
+        echo "Files committed: $blobs_created"
+        echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+        echo "============================================"
